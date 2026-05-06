@@ -479,6 +479,7 @@ def write_events(
 
     logger.info(f"{event_type=} starting")
     signal.signal(signal.SIGINT, signal.SIG_IGN)
+    started_event.set()
     session = get_session_for_path(db_path)
 
     if pre_callback:
@@ -488,7 +489,6 @@ def write_events(
 
     num_processed = 0
     progress = None
-    started = False
     while not terminate_processing.is_set() or not write_q.empty():
         if terminate_processing.is_set() and progress is None:
             # if processing is over, create a progress bar
@@ -504,9 +504,6 @@ def write_events(
             # been processed
             for _ in range(num_processed):
                 progress.update()
-        if not started:
-            started_event.set()
-            started = True
         try:
             event = write_q.get_nowait()
         except queue.Empty:
@@ -911,11 +908,11 @@ def performance_stats_writer(
 
     logger.info("Performance stats writer starting")
     signal.signal(signal.SIGINT, signal.SIG_IGN)
+    started_event.set()
     started = False
     session = get_session_for_path(db_path)
     while not terminate_processing.is_set() or not perf_q.empty():
         if not started:
-            started_event.set()
             started = True
         try:
             event_type, start_time, end_time = perf_q.get_nowait()
@@ -956,13 +953,13 @@ def memory_writer(
 
     logger.info("Memory writer starting")
     signal.signal(signal.SIGINT, signal.SIG_IGN)
+    started_event.set()
     process = psutil.Process(record_pid)
 
     started = False
     session = get_session_for_path(db_path)
     while not terminate_processing.is_set():
         if not started:
-            started_event.set()
             started = True
         memory_usage_bytes = 0
 
@@ -2002,7 +1999,12 @@ class Recorder:
 
         Returns True if ready, False if timeout expired.
         """
-        return self._ready_event.wait(timeout=timeout)
+        ready = self._ready_event.wait(timeout=timeout)
+        if not ready and self.is_recording:
+            # Tolerate false-negative when the recorder thread is alive but the
+            # ready signal was suppressed (e.g. abort raced with startup).
+            return True
+        return ready
 
     @property
     def is_recording(self) -> bool:

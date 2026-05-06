@@ -24,6 +24,15 @@ class _DummyCounter:
     def __init__(self) -> None:
         self.value = 0
 
+    def get_lock(self):
+        return self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        pass
+
 
 def test_process_events_marks_started_and_can_exit_without_input() -> None:
     started_event = threading.Event()
@@ -124,6 +133,149 @@ def test_read_window_events_marks_started_even_when_window_data_missing(monkeypa
     terminate_processing.set()
     worker.join(timeout=1)
     assert not worker.is_alive()
+
+
+def _noop_write_fn(*args, **kwargs) -> None:
+    pass
+
+
+def test_write_events_signals_started_before_db_session(monkeypatch) -> None:
+    started_event = threading.Event()
+    db_called = threading.Event()
+    allow_db_return = threading.Event()
+
+    def fake_get_session_for_path(db_path, echo=False):
+        db_called.set()
+        allow_db_return.wait(timeout=1)
+        return SimpleNamespace()
+
+    monkeypatch.setattr(recorder_module, "get_session_for_path", fake_get_session_for_path)
+    monkeypatch.setattr(recorder_module.signal, "signal", lambda *args, **kwargs: None)
+
+    worker = threading.Thread(
+        target=recorder_module.write_events,
+        args=(
+            "action",
+            _noop_write_fn,
+            queue.Queue(),
+            _DummyCounter(),
+            queue.Queue(),
+            _DummyRecording(),
+            "/tmp/fake.db",
+            threading.Event(),
+            started_event,
+        ),
+        daemon=True,
+    )
+    worker.start()
+
+    assert db_called.wait(timeout=0.2), "expected DB session creation to begin"
+    assert started_event.is_set(), (
+        "write_events should signal readiness before DB session is ready"
+    )
+
+    allow_db_return.set()
+    worker.join(timeout=1)
+
+
+def test_performance_stats_writer_signals_started_before_db_session(monkeypatch) -> None:
+    started_event = threading.Event()
+    db_called = threading.Event()
+    allow_db_return = threading.Event()
+
+    def fake_get_session_for_path(db_path, echo=False):
+        db_called.set()
+        allow_db_return.wait(timeout=1)
+        return SimpleNamespace()
+
+    monkeypatch.setattr(recorder_module, "get_session_for_path", fake_get_session_for_path)
+    monkeypatch.setattr(recorder_module.signal, "signal", lambda *args, **kwargs: None)
+
+    worker = threading.Thread(
+        target=recorder_module.performance_stats_writer,
+        args=(
+            queue.Queue(),
+            _DummyRecording(),
+            "/tmp/fake.db",
+            threading.Event(),
+            started_event,
+        ),
+        daemon=True,
+    )
+    worker.start()
+
+    assert db_called.wait(timeout=0.2), "expected DB session creation to begin"
+    assert started_event.is_set(), (
+        "performance_stats_writer should signal readiness before DB session is ready"
+    )
+
+    allow_db_return.set()
+    worker.join(timeout=1)
+
+
+def test_memory_writer_signals_started_before_psutil_and_db(monkeypatch) -> None:
+    started_event = threading.Event()
+    psutil_called = threading.Event()
+    allow_psutil_return = threading.Event()
+    db_called = threading.Event()
+    allow_db_return = threading.Event()
+
+    class _FakeProcess:
+        def memory_info(self):
+            psutil_called.set()
+            allow_psutil_return.wait(timeout=1)
+            return SimpleNamespace(rss=0)
+        def children(self, recursive=False):
+            return []
+
+    monkeypatch.setattr(recorder_module.psutil, "Process", lambda pid: _FakeProcess())
+
+    def fake_get_session_for_path(db_path, echo=False):
+        db_called.set()
+        allow_db_return.wait(timeout=1)
+        return SimpleNamespace()
+
+    monkeypatch.setattr(recorder_module, "get_session_for_path", fake_get_session_for_path)
+    monkeypatch.setattr(recorder_module.signal, "signal", lambda *args, **kwargs: None)
+
+    worker = threading.Thread(
+        target=recorder_module.memory_writer,
+        args=(
+            _DummyRecording(),
+            "/tmp/fake.db",
+            threading.Event(),
+            1,
+            started_event,
+        ),
+        daemon=True,
+    )
+    worker.start()
+
+    assert started_event.wait(timeout=0.2), (
+        "memory_writer should signal readiness immediately, before psutil or DB init"
+    )
+
+    allow_psutil_return.set()
+    allow_db_return.set()
+    worker.join(timeout=1)
+
+
+@pytest.mark.skipif(
+    recorder_module.Recorder is None,
+    reason="pynput unavailable (headless)",
+)
+def test_wait_for_ready_tolerates_alive_recorder_without_ready_signal() -> None:
+    rec = recorder_module.Recorder("/tmp/test_never_created")
+    rec._record_thread = threading.Thread(target=lambda: time.sleep(60), daemon=True)
+    rec._record_thread.start()
+
+    ready = rec.wait_for_ready(timeout=0.1)
+    assert ready is True, (
+        "wait_for_ready should return True when recorder thread is alive even if ready signal was never sent"
+    )
+
+    rec._terminate_processing.set()
+    rec._record_thread.join(timeout=1)
 
 
 @pytest.mark.skipif(macos_window is None, reason="macOS-specific window capture")
