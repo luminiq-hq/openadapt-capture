@@ -1711,7 +1711,12 @@ def record(
     # Wait for all to signal they've started
     expected_starts = len(task_by_name)
     logger.info(f"{expected_starts=}")
+    startup_aborted = False
     while True:
+        if terminate_processing.is_set():
+            startup_aborted = True
+            logger.info("Termination requested while waiting for tasks to start")
+            break
         started_tasks = sum(event.is_set() for event in task_started_events.values())
         if started_tasks >= expected_starts:
             break
@@ -1722,12 +1727,13 @@ def record(
         logger.info(f"Started tasks: {started_tasks}/{expected_starts}")
         time.sleep(1)  # Sleep to reduce busy waiting
 
-    for _ in range(5):
-        logger.info("*" * 40)
-    logger.info("All readers and writers have started. Waiting for input events...")
+    if not startup_aborted:
+        for _ in range(5):
+            logger.info("*" * 40)
+        logger.info("All readers and writers have started. Waiting for input events...")
 
-    if status_pipe:
-        status_pipe.send({"type": "record.started"})
+        if status_pipe:
+            status_pipe.send({"type": "record.started"})
 
     global stop_sequence_detected
     stop_sequence_detected = False
