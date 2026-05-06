@@ -253,12 +253,12 @@ def process_events(
     prev_window_event = None
     prev_saved_screen_timestamp = 0
     prev_saved_window_timestamp = 0
-    started = False
+    started_event.set()
     while not terminate_processing.is_set() or not event_q.empty():
-        event = event_q.get()
-        if not started:
-            started_event.set()
-            started = True
+        try:
+            event = event_q.get(timeout=0.1)
+        except queue.Empty:
+            continue
         logger.trace(f"{event=}")
         assert event.type in EVENT_TYPES, event
         if prev_event is not None:
@@ -815,7 +815,7 @@ def read_screen_events(
     min_interval = 1.0 / fps if fps > 0 else 0.0
 
     logger.info(f"Starting (fps={fps}, min_interval={min_interval:.3f}s)")
-    started = False
+    started_event.set()
     while not terminate_processing.is_set():
         t_start = time.perf_counter()
         screenshot = utils.take_screenshot()
@@ -823,9 +823,6 @@ def read_screen_events(
         if screenshot is None:
             logger.warning("Screenshot was None")
             continue
-        if not started:
-            started_event.set()
-            started = True
         event_q.put(Event(utils.get_timestamp(), "screen", screenshot))
         # Throttle: sleep for the remainder of the frame interval
         if min_interval > 0:
@@ -857,17 +854,13 @@ def read_window_events(
     utils.set_start_time(recording.timestamp)
 
     logger.info("Starting")
+    started_event.set()
     prev_window_data = {}
-    started = False
     while not terminate_processing.is_set():
         window_data = window.get_active_window_data()
         if not window_data:
             time.sleep(0.1)
             continue
-
-        if not started:
-            started_event.set()
-            started = True
 
         if window_data["title"] != prev_window_data.get("title") or window_data[
             "window_id"

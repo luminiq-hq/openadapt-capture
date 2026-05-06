@@ -39,17 +39,17 @@ def get_active_window_state(read_window_data: bool) -> dict | None:
     else:
         data = {}
     title_parts = [
-        meta["kCGWindowOwnerName"],
-        meta["kCGWindowName"],
+        meta.get("kCGWindowOwnerName", ""),
+        meta.get("kCGWindowName", ""),
     ]
     title_parts = [part for part in title_parts if part]
     title = " ".join(title_parts)
-    window_id = meta["kCGWindowNumber"]
-    bounds = meta["kCGWindowBounds"]
-    left = bounds["X"]
-    top = bounds["Y"]
-    width = bounds["Width"]
-    height = bounds["Height"]
+    window_id = meta.get("kCGWindowNumber", 0)
+    bounds = meta.get("kCGWindowBounds", {})
+    left = bounds.get("X", 0)
+    top = bounds.get("Y", 0)
+    width = bounds.get("Width", 0)
+    height = bounds.get("Height", 0)
     rval = {
         "title": title,
         "left": left,
