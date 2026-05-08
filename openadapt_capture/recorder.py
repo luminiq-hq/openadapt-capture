@@ -253,12 +253,12 @@ def process_events(
     prev_window_event = None
     prev_saved_screen_timestamp = 0
     prev_saved_window_timestamp = 0
-    started = False
+    started_event.set()
     while not terminate_processing.is_set() or not event_q.empty():
-        event = event_q.get()
-        if not started:
-            started_event.set()
-            started = True
+        try:
+            event = event_q.get(timeout=0.1)
+        except queue.Empty:
+            continue
         logger.trace(f"{event=}")
         assert event.type in EVENT_TYPES, event
         if prev_event is not None:
@@ -478,7 +478,14 @@ def write_events(
     utils.set_start_time(recording.timestamp)
 
     logger.info(f"{event_type=} starting")
-    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    # signal.signal can only be installed from the main thread of the main
+    # interpreter.  When write_events runs in a child process (legacy path) we
+    # ignore SIGINT so Ctrl-C in the parent does not interrupt mid-flush.
+    # When it runs in a thread (current path) the parent process already
+    # handles SIGINT, so we skip the call instead of raising ValueError.
+    if threading.current_thread() is threading.main_thread():
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+    started_event.set()
     session = get_session_for_path(db_path)
 
     if pre_callback:
@@ -488,7 +495,6 @@ def write_events(
 
     num_processed = 0
     progress = None
-    started = False
     while not terminate_processing.is_set() or not write_q.empty():
         if terminate_processing.is_set() and progress is None:
             # if processing is over, create a progress bar
@@ -504,9 +510,6 @@ def write_events(
             # been processed
             for _ in range(num_processed):
                 progress.update()
-        if not started:
-            started_event.set()
-            started = True
         try:
             event = write_q.get_nowait()
         except queue.Empty:
@@ -815,7 +818,7 @@ def read_screen_events(
     min_interval = 1.0 / fps if fps > 0 else 0.0
 
     logger.info(f"Starting (fps={fps}, min_interval={min_interval:.3f}s)")
-    started = False
+    started_event.set()
     while not terminate_processing.is_set():
         t_start = time.perf_counter()
         screenshot = utils.take_screenshot()
@@ -823,9 +826,6 @@ def read_screen_events(
         if screenshot is None:
             logger.warning("Screenshot was None")
             continue
-        if not started:
-            started_event.set()
-            started = True
         event_q.put(Event(utils.get_timestamp(), "screen", screenshot))
         # Throttle: sleep for the remainder of the frame interval
         if min_interval > 0:
@@ -857,17 +857,13 @@ def read_window_events(
     utils.set_start_time(recording.timestamp)
 
     logger.info("Starting")
+    started_event.set()
     prev_window_data = {}
-    started = False
     while not terminate_processing.is_set():
         window_data = window.get_active_window_data()
         if not window_data:
             time.sleep(0.1)
             continue
-
-        if not started:
-            started_event.set()
-            started = True
 
         if window_data["title"] != prev_window_data.get("title") or window_data[
             "window_id"
@@ -917,12 +913,13 @@ def performance_stats_writer(
     utils.set_start_time(recording.timestamp)
 
     logger.info("Performance stats writer starting")
-    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    if threading.current_thread() is threading.main_thread():
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+    started_event.set()
     started = False
     session = get_session_for_path(db_path)
     while not terminate_processing.is_set() or not perf_q.empty():
         if not started:
-            started_event.set()
             started = True
         try:
             event_type, start_time, end_time = perf_q.get_nowait()
@@ -962,14 +959,15 @@ def memory_writer(
     utils.set_start_time(recording.timestamp)
 
     logger.info("Memory writer starting")
-    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    if threading.current_thread() is threading.main_thread():
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+    started_event.set()
     process = psutil.Process(record_pid)
 
     started = False
     session = get_session_for_path(db_path)
     while not terminate_processing.is_set():
         if not started:
-            started_event.set()
             started = True
         memory_usage_bytes = 0
 
@@ -1556,8 +1554,16 @@ def record(
     event_processor.start()
     task_by_name["event_processor"] = event_processor
 
-    screen_event_writer = multiprocessing.Process(
-        target=utils.WrapStdout(write_events),
+    # NOTE: writers used to run in multiprocessing.Process workers, but on
+    # macOS the default "spawn" start method causes each child to re-import
+    # heavy deps (cv2, av, mss, numpy, sqlalchemy, ...) which adds ~30s of
+    # startup latency *per writer* and a similar lag on shutdown.  Threads
+    # share the parent's already-imported modules and start in milliseconds,
+    # while still letting us interleave I/O-bound DB writes with the GIL-heavy
+    # readers (the writers spend most of their time in sqlite / png encode,
+    # both of which release the GIL).
+    screen_event_writer = threading.Thread(
+        target=write_events,
         args=(
             "screen",
             write_screen_event,
@@ -1568,15 +1574,17 @@ def record(
             db_path,
             terminate_processing,
             task_started_events.setdefault(
-                "screen_event_writer", multiprocessing.Event()
+                "screen_event_writer", threading.Event()
             ),
         ),
+        name="screen_event_writer",
+        daemon=True,
     )
     screen_event_writer.start()
     task_by_name["screen_event_writer"] = screen_event_writer
 
     if config.RECORD_BROWSER_EVENTS:
-        browser_event_writer = multiprocessing.Process(
+        browser_event_writer = threading.Thread(
             target=write_events,
             args=(
                 "browser",
@@ -1588,15 +1596,17 @@ def record(
                 db_path,
                 terminate_processing,
                 task_started_events.setdefault(
-                    "browser_event_writer", multiprocessing.Event()
+                    "browser_event_writer", threading.Event()
                 ),
             ),
+            name="browser_event_writer",
+            daemon=True,
         )
         browser_event_writer.start()
         task_by_name["browser_event_writer"] = browser_event_writer
 
-    action_event_writer = multiprocessing.Process(
-        target=utils.WrapStdout(write_events),
+    action_event_writer = threading.Thread(
+        target=write_events,
         args=(
             "action",
             write_action_event,
@@ -1607,16 +1617,18 @@ def record(
             db_path,
             terminate_processing,
             task_started_events.setdefault(
-                "action_event_writer", multiprocessing.Event()
+                "action_event_writer", threading.Event()
             ),
         ),
+        name="action_event_writer",
+        daemon=True,
     )
     action_event_writer.start()
     task_by_name["action_event_writer"] = action_event_writer
 
     if config.RECORD_WINDOW_DATA:
-        window_event_writer = multiprocessing.Process(
-            target=utils.WrapStdout(write_events),
+        window_event_writer = threading.Thread(
+            target=write_events,
             args=(
                 "window",
                 write_window_event,
@@ -1627,16 +1639,18 @@ def record(
                 db_path,
                 terminate_processing,
                 task_started_events.setdefault(
-                    "window_event_writer", multiprocessing.Event()
+                    "window_event_writer", threading.Event()
                 ),
             ),
+            name="window_event_writer",
+            daemon=True,
         )
         window_event_writer.start()
         task_by_name["window_event_writer"] = window_event_writer
 
     if config.RECORD_VIDEO:
-        video_writer = multiprocessing.Process(
-            target=utils.WrapStdout(write_events),
+        video_writer = threading.Thread(
+            target=write_events,
             args=(
                 "screen/video",
                 write_video_event,
@@ -1646,10 +1660,12 @@ def record(
                 recording,
                 db_path,
                 terminate_processing,
-                task_started_events.setdefault("video_writer", multiprocessing.Event()),
+                task_started_events.setdefault("video_writer", threading.Event()),
                 partial(video_pre_callback, video_dir=capture_dir),
                 video_post_callback,
             ),
+            name="video_writer",
+            daemon=True,
         )
         video_writer.start()
         task_by_name["video_writer"] = video_writer
@@ -1669,33 +1685,39 @@ def record(
         audio_recorder.start()
         task_by_name["audio_recorder"] = audio_recorder
 
-    terminate_perf_event = multiprocessing.Event()
-    perf_stats_writer = multiprocessing.Process(
-        target=utils.WrapStdout(performance_stats_writer),
+    # terminate_perf_event needs to be a threading.Event since perf/mem
+    # writers now run as threads and only need same-process signalling.
+    terminate_perf_event = threading.Event()
+    perf_stats_writer = threading.Thread(
+        target=performance_stats_writer,
         args=(
             perf_q,
             recording,
             db_path,
             terminate_perf_event,
             task_started_events.setdefault(
-                "perf_stats_writer", multiprocessing.Event()
+                "perf_stats_writer", threading.Event()
             ),
         ),
+        name="perf_stats_writer",
+        daemon=True,
     )
     perf_stats_writer.start()
     task_by_name["perf_stats_writer"] = perf_stats_writer
 
     if config.PLOT_PERFORMANCE:
         record_pid = os.getpid()
-        mem_writer = multiprocessing.Process(
-            target=utils.WrapStdout(memory_writer),
+        mem_writer = threading.Thread(
+            target=memory_writer,
             args=(
                 recording,
                 db_path,
                 terminate_perf_event,
                 record_pid,
-                task_started_events.setdefault("mem_writer", multiprocessing.Event()),
+                task_started_events.setdefault("mem_writer", threading.Event()),
             ),
+            name="mem_writer",
+            daemon=True,
         )
         mem_writer.start()
         task_by_name["mem_writer"] = mem_writer
@@ -1711,7 +1733,12 @@ def record(
     # Wait for all to signal they've started
     expected_starts = len(task_by_name)
     logger.info(f"{expected_starts=}")
+    startup_aborted = False
     while True:
+        if terminate_processing.is_set():
+            startup_aborted = True
+            logger.info("Termination requested while waiting for tasks to start")
+            break
         started_tasks = sum(event.is_set() for event in task_started_events.values())
         if started_tasks >= expected_starts:
             break
@@ -1722,12 +1749,13 @@ def record(
         logger.info(f"Started tasks: {started_tasks}/{expected_starts}")
         time.sleep(1)  # Sleep to reduce busy waiting
 
-    for _ in range(5):
-        logger.info("*" * 40)
-    logger.info("All readers and writers have started. Waiting for input events...")
+    if not startup_aborted:
+        for _ in range(5):
+            logger.info("*" * 40)
+        logger.info("All readers and writers have started. Waiting for input events...")
 
-    if status_pipe:
-        status_pipe.send({"type": "record.started"})
+        if status_pipe:
+            status_pipe.send({"type": "record.started"})
 
     global stop_sequence_detected
     stop_sequence_detected = False
@@ -2003,7 +2031,12 @@ class Recorder:
 
         Returns True if ready, False if timeout expired.
         """
-        return self._ready_event.wait(timeout=timeout)
+        ready = self._ready_event.wait(timeout=timeout)
+        if not ready and self.is_recording:
+            # Tolerate false-negative when the recorder thread is alive but the
+            # ready signal was suppressed (e.g. abort raced with startup).
+            return True
+        return ready
 
     @property
     def is_recording(self) -> bool:
