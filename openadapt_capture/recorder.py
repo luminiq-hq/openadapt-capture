@@ -478,7 +478,13 @@ def write_events(
     utils.set_start_time(recording.timestamp)
 
     logger.info(f"{event_type=} starting")
-    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    # signal.signal can only be installed from the main thread of the main
+    # interpreter.  When write_events runs in a child process (legacy path) we
+    # ignore SIGINT so Ctrl-C in the parent does not interrupt mid-flush.
+    # When it runs in a thread (current path) the parent process already
+    # handles SIGINT, so we skip the call instead of raising ValueError.
+    if threading.current_thread() is threading.main_thread():
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
     started_event.set()
     session = get_session_for_path(db_path)
 
@@ -907,7 +913,8 @@ def performance_stats_writer(
     utils.set_start_time(recording.timestamp)
 
     logger.info("Performance stats writer starting")
-    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    if threading.current_thread() is threading.main_thread():
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
     started_event.set()
     started = False
     session = get_session_for_path(db_path)
@@ -952,7 +959,8 @@ def memory_writer(
     utils.set_start_time(recording.timestamp)
 
     logger.info("Memory writer starting")
-    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    if threading.current_thread() is threading.main_thread():
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
     started_event.set()
     process = psutil.Process(record_pid)
 
@@ -1546,8 +1554,16 @@ def record(
     event_processor.start()
     task_by_name["event_processor"] = event_processor
 
-    screen_event_writer = multiprocessing.Process(
-        target=utils.WrapStdout(write_events),
+    # NOTE: writers used to run in multiprocessing.Process workers, but on
+    # macOS the default "spawn" start method causes each child to re-import
+    # heavy deps (cv2, av, mss, numpy, sqlalchemy, ...) which adds ~30s of
+    # startup latency *per writer* and a similar lag on shutdown.  Threads
+    # share the parent's already-imported modules and start in milliseconds,
+    # while still letting us interleave I/O-bound DB writes with the GIL-heavy
+    # readers (the writers spend most of their time in sqlite / png encode,
+    # both of which release the GIL).
+    screen_event_writer = threading.Thread(
+        target=write_events,
         args=(
             "screen",
             write_screen_event,
@@ -1558,15 +1574,17 @@ def record(
             db_path,
             terminate_processing,
             task_started_events.setdefault(
-                "screen_event_writer", multiprocessing.Event()
+                "screen_event_writer", threading.Event()
             ),
         ),
+        name="screen_event_writer",
+        daemon=True,
     )
     screen_event_writer.start()
     task_by_name["screen_event_writer"] = screen_event_writer
 
     if config.RECORD_BROWSER_EVENTS:
-        browser_event_writer = multiprocessing.Process(
+        browser_event_writer = threading.Thread(
             target=write_events,
             args=(
                 "browser",
@@ -1578,15 +1596,17 @@ def record(
                 db_path,
                 terminate_processing,
                 task_started_events.setdefault(
-                    "browser_event_writer", multiprocessing.Event()
+                    "browser_event_writer", threading.Event()
                 ),
             ),
+            name="browser_event_writer",
+            daemon=True,
         )
         browser_event_writer.start()
         task_by_name["browser_event_writer"] = browser_event_writer
 
-    action_event_writer = multiprocessing.Process(
-        target=utils.WrapStdout(write_events),
+    action_event_writer = threading.Thread(
+        target=write_events,
         args=(
             "action",
             write_action_event,
@@ -1597,16 +1617,18 @@ def record(
             db_path,
             terminate_processing,
             task_started_events.setdefault(
-                "action_event_writer", multiprocessing.Event()
+                "action_event_writer", threading.Event()
             ),
         ),
+        name="action_event_writer",
+        daemon=True,
     )
     action_event_writer.start()
     task_by_name["action_event_writer"] = action_event_writer
 
     if config.RECORD_WINDOW_DATA:
-        window_event_writer = multiprocessing.Process(
-            target=utils.WrapStdout(write_events),
+        window_event_writer = threading.Thread(
+            target=write_events,
             args=(
                 "window",
                 write_window_event,
@@ -1617,16 +1639,18 @@ def record(
                 db_path,
                 terminate_processing,
                 task_started_events.setdefault(
-                    "window_event_writer", multiprocessing.Event()
+                    "window_event_writer", threading.Event()
                 ),
             ),
+            name="window_event_writer",
+            daemon=True,
         )
         window_event_writer.start()
         task_by_name["window_event_writer"] = window_event_writer
 
     if config.RECORD_VIDEO:
-        video_writer = multiprocessing.Process(
-            target=utils.WrapStdout(write_events),
+        video_writer = threading.Thread(
+            target=write_events,
             args=(
                 "screen/video",
                 write_video_event,
@@ -1636,10 +1660,12 @@ def record(
                 recording,
                 db_path,
                 terminate_processing,
-                task_started_events.setdefault("video_writer", multiprocessing.Event()),
+                task_started_events.setdefault("video_writer", threading.Event()),
                 partial(video_pre_callback, video_dir=capture_dir),
                 video_post_callback,
             ),
+            name="video_writer",
+            daemon=True,
         )
         video_writer.start()
         task_by_name["video_writer"] = video_writer
@@ -1659,33 +1685,39 @@ def record(
         audio_recorder.start()
         task_by_name["audio_recorder"] = audio_recorder
 
-    terminate_perf_event = multiprocessing.Event()
-    perf_stats_writer = multiprocessing.Process(
-        target=utils.WrapStdout(performance_stats_writer),
+    # terminate_perf_event needs to be a threading.Event since perf/mem
+    # writers now run as threads and only need same-process signalling.
+    terminate_perf_event = threading.Event()
+    perf_stats_writer = threading.Thread(
+        target=performance_stats_writer,
         args=(
             perf_q,
             recording,
             db_path,
             terminate_perf_event,
             task_started_events.setdefault(
-                "perf_stats_writer", multiprocessing.Event()
+                "perf_stats_writer", threading.Event()
             ),
         ),
+        name="perf_stats_writer",
+        daemon=True,
     )
     perf_stats_writer.start()
     task_by_name["perf_stats_writer"] = perf_stats_writer
 
     if config.PLOT_PERFORMANCE:
         record_pid = os.getpid()
-        mem_writer = multiprocessing.Process(
-            target=utils.WrapStdout(memory_writer),
+        mem_writer = threading.Thread(
+            target=memory_writer,
             args=(
                 recording,
                 db_path,
                 terminate_perf_event,
                 record_pid,
-                task_started_events.setdefault("mem_writer", multiprocessing.Event()),
+                task_started_events.setdefault("mem_writer", threading.Event()),
             ),
+            name="mem_writer",
+            daemon=True,
         )
         mem_writer.start()
         task_by_name["mem_writer"] = mem_writer
