@@ -394,12 +394,8 @@ def write_screen_event(
         perf_q: A queue for collecting performance data.
     """
     assert event.type == "screen", event
-    image = event.data
+    png_data = event.data  # already bytes — compressed upstream in read_screen_events()
     if config.RECORD_IMAGES:
-        with io.BytesIO() as output:
-            image.save(output, format="PNG")
-            png_data = output.getvalue()
-        image.close()
         event_data = {"png_data": png_data}
     else:
         event_data = {}
@@ -509,11 +505,12 @@ def write_events(
             started_event.set()
             started = True
         try:
-            event = write_q.get_nowait()
+            event = write_q.get(timeout=0.1)
         except queue.Empty:
             continue
         assert event.type == event_type, (event_type, event)
         state = write_fn(session, recording, event, perf_q, **(state or {}))
+        session.expunge_all()
         num_processed += 1
         with num_events.get_lock():
             if progress is not None:
@@ -865,7 +862,13 @@ def read_screen_events(
             screenshot.close()
             continue
 
-        event_q.put(Event(utils.get_timestamp(), "screen", screenshot))
+        # Compress to PNG immediately — queues carry ~2-3 MB bytes, not ~16 MB raw pixels
+        with io.BytesIO() as buf:
+            screenshot.save(buf, format="PNG")
+            png_bytes = buf.getvalue()
+        screenshot.close()
+
+        event_q.put(Event(utils.get_timestamp(), "screen", png_bytes))
 
         if _screen_timing is not None:
             t_end = time.perf_counter()
